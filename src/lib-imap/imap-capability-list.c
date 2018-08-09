@@ -37,13 +37,14 @@ void imap_capability_list_unref(struct imap_capability_list **capability_list)
 {
 	i_assert((*capability_list)->refcount > 0);
 
-	*capability_list = NULL;
-
-	if (--(*capability_list)->refcount > 0)
+	if (--(*capability_list)->refcount > 0) {
+		*capability_list = NULL;
 		return;
+	}
 
 	pool_unref(&(*capability_list)->pool);
 	i_free(*capability_list);
+	*capability_list = NULL;
 }
 
 /* add an entry to the imap capability list */
