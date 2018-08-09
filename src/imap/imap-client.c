@@ -24,6 +24,7 @@
 #include "imap-search.h"
 #include "imap-notify.h"
 #include "imap-commands.h"
+#include "imap-capability-list.h"
 
 #include <unistd.h>
 
@@ -156,17 +157,22 @@ struct client *client_create(int fd_in, int fd_out, const char *session_id,
 					     &client->output);
 	}
 
-	client->capability_string =
-		str_new(client->pool, sizeof(CAPABILITY_STRING)+64);
+	/* create our capability list */
+	client->capability_list = imap_capability_list_create(NULL);
 
 	if (*set->imap_capability == '\0')
-		str_append(client->capability_string, CAPABILITY_STRING);
+		imap_capability_list_append_string(client->capability_list,
+				CAPABILITY_STRING);
 	else if (*set->imap_capability != '+') {
-		str_append(client->capability_string, set->imap_capability);
+		imap_capability_list_append_string(client->capability_list,
+				set->imap_capability);
 	} else {
-		str_append(client->capability_string, CAPABILITY_STRING);
-		str_append_c(client->capability_string, ' ');
-		str_append(client->capability_string, set->imap_capability + 1);
+		/* add the capability banner string to the cap list */
+		imap_capability_list_append_string(client->capability_list,
+				CAPABILITY_STRING);
+		/* add everything after the plus to our cap list */
+		imap_capability_list_append_string(client->capability_list,
+				client->set->imap_capability + 1);
 	}
 	if (client->set->imap_literal_minus)
 		client_add_capability(client, "LITERAL-");
@@ -552,8 +558,36 @@ void client_add_capability(struct client *client, const char *capability)
 		/* explicit capability - don't change it */
 		return;
 	}
-	str_append_c(client->capability_string, ' ');
-	str_append(client->capability_string, capability);
+
+	/* add it to our capability list as CAP_ALWAYS */
+	imap_capability_list_add(client->capability_list,
+			capability, IMAP_CAP_VISIBILITY_ALWAYS);
+}
+
+const char *client_get_capability(struct client *client)
+{
+	string_t *cap_str = t_str_new(256);
+
+	/* imap is postauth by definition */
+	uint32_t flags = IMAP_CAP_VISIBILITY_POSTAUTH;
+
+	/* is the client secured by means of ssl? */
+	if (client->ssl_secured)
+		flags |= IMAP_CAP_VISIBILITY_TLS_ACTIVE;
+	else
+		flags |= IMAP_CAP_VISIBILITY_TLS_INACTIVE;
+
+	/* Are we secured? (localhost? tls? etc) */
+	if (client->secured)
+		flags |= IMAP_CAP_VISIBILITY_SECURE;
+	else
+		flags |= IMAP_CAP_VISIBILITY_INSECURE;
+
+	/* build capability string based on IMAP_CAP_VISIBILITY_ flags */
+	imap_capability_list_get_capability(client->capability_list,
+			cap_str, flags);
+
+	return str_c(cap_str);
 }
 
 void client_send_line(struct client *client, const char *data)
