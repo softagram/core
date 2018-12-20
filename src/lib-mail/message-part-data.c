@@ -25,6 +25,7 @@ bool message_part_data_is_plain_7bit(const struct message_part *part)
 {
 	const struct message_part_data *data = part->data;
 
+	i_assert(data != NULL);
 	i_assert(part->parent == NULL);
 
 	/* if content-type is text/xxx we don't have to check any
@@ -72,6 +73,8 @@ bool message_part_data_get_filename(const struct message_part *part,
 	const struct message_part_data *data = part->data;
 	const struct message_part_param *params;
 	unsigned int params_count, i;
+
+	i_assert(data != NULL);
 
 	params = data->content_disposition_params;
 	params_count = data->content_disposition_params_count;
@@ -167,28 +170,6 @@ envelope_get_field(const char *name)
 	return ENVELOPE_FIELD_UNKNOWN;
 }
 
-static const char *
-hdr_strdup(pool_t pool, const unsigned char *data, size_t size)
-{
-	if (memchr(data, '\0', size) == NULL) {
-		/* fast path */
-		char *dest = p_malloc(pool, size+1);
-		memcpy(dest, data, size);
-		return dest;
-	}
-
-	/* slow path - this could be made faster, but it should be
-	   rare so keep it simple */
-	string_t *str = str_new(pool, size+2);
-	for (size_t i = 0; i < size; i++) {
-		if (data[i] != '\0')
-			str_append_c(str, data[i]);
-		else
-			str_append(str, UNICODE_REPLACEMENT_CHAR_UTF8);
-	}
-	return str_c(str);
-}
-
 void message_part_envelope_parse_from_header(pool_t pool,
 	struct message_part_envelope **data,
 	struct message_header_line *hdr)
@@ -255,9 +236,11 @@ void message_part_envelope_parse_from_header(pool_t pool,
 	if (addr_p != NULL) {
 		*addr_p = message_address_parse(pool, hdr->full_value,
 						hdr->full_value_len,
-						UINT_MAX, TRUE);
+						UINT_MAX,
+						MESSAGE_ADDRESS_PARSE_FLAG_FILL_MISSING);
 	} else if (str_p != NULL) {
-		*str_p = hdr_strdup(pool, hdr->full_value, hdr->full_value_len);
+		*str_p = message_header_strdup(pool, hdr->full_value,
+					       hdr->full_value_len);
 	}
 }
 
@@ -316,6 +299,12 @@ parse_content_type(struct message_part_data *data,
 	}
 	str_truncate(str, i);
 	data->content_type = p_strdup(pool, str_c(str));
+	if (data->content_subtype == NULL) {
+		/* The Content-Type is invalid. Don't leave it NULL so that
+		   callers can assume that if content_type != NULL,
+		   content_subtype != NULL also. */
+		data->content_subtype = p_strdup(pool, "");
+	}
 
 	if (ret < 0) {
 		/* Content-Type is broken, but we wanted to get it as well as
@@ -429,15 +418,17 @@ parse_content_header(struct message_part_data *data,
 	case 'i':
 	case 'I':
 		if (strcasecmp(name, "ID") == 0 && data->content_id == NULL)
-			data->content_id = hdr_strdup(pool, hdr->full_value,
+			data->content_id =
+				message_header_strdup(pool, hdr->full_value,
 						      hdr->full_value_len);
 		break;
 
 	case 'm':
 	case 'M':
 		if (strcasecmp(name, "MD5") == 0 && data->content_md5 == NULL)
-			data->content_md5 = hdr_strdup(pool, hdr->full_value,
-						       hdr->full_value_len);
+			data->content_md5 =
+				message_header_strdup(pool, hdr->full_value,
+						      hdr->full_value_len);
 		break;
 
 	case 't':
@@ -458,8 +449,8 @@ parse_content_header(struct message_part_data *data,
 		} else if (strcasecmp(name, "Location") == 0 &&
 			   data->content_location == NULL) {
 			data->content_location =
-				hdr_strdup(pool, hdr->full_value,
-					   hdr->full_value_len);
+				message_header_strdup(pool, hdr->full_value,
+						      hdr->full_value_len);
 		}
 		break;
 
@@ -468,8 +459,8 @@ parse_content_header(struct message_part_data *data,
 		if (strcasecmp(name, "Description") == 0 &&
 		    data->content_description == NULL)
 			data->content_description =
-				hdr_strdup(pool, hdr->full_value,
-					   hdr->full_value_len);
+				message_header_strdup(pool, hdr->full_value,
+						      hdr->full_value_len);
 		else if (strcasecmp(name, "Disposition") == 0 &&
 			 data->content_disposition_params == NULL)
 			parse_content_disposition(data, pool, hdr);
@@ -538,6 +529,8 @@ bool message_part_has_content_types(struct message_part *part,
 	const char *const *ptr;
 	const char *content_type;
 
+	i_assert(data != NULL);
+
 	if (data->content_type == NULL)
 		return FALSE;
 	else if (data->content_subtype == NULL)
@@ -558,6 +551,8 @@ bool message_part_has_parameter(struct message_part *part, const char *parameter
 				bool has_value)
 {
 	struct message_part_data *data = part->data;
+
+	i_assert(data != NULL);
 
 	for (unsigned int i = 0; i < data->content_disposition_params_count; i++) {
 		const struct message_part_param *param =

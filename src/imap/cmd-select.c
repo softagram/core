@@ -108,8 +108,7 @@ select_parse_qresync(struct imap_select_context *ctx,
 	const char *str;
 	unsigned int count;
 
-	if ((ctx->cmd->client->enabled_features &
-	     MAILBOX_FEATURE_QRESYNC) == 0) {
+	if (!client_has_enabled(ctx->cmd->client, imap_feature_qresync)) {
 		*error_r = "QRESYNC not enabled";
 		return FALSE;
 	}
@@ -291,8 +290,7 @@ select_open(struct imap_select_context *ctx, const char *mailbox, bool readonly)
 		return -1;
 	}
 
-	if (client->enabled_features != 0)
-		ret = mailbox_enable(ctx->box, client->enabled_features);
+	ret = mailbox_enable(ctx->box, client_enabled_mailbox_features(client));
 	if (ret < 0 ||
 	    mailbox_sync(ctx->box, MAILBOX_SYNC_FLAG_FULL_READ) < 0) {
 		client_send_box_error(ctx->cmd, ctx->box);
@@ -411,7 +409,7 @@ bool cmd_select_full(struct client_command_context *cmd, bool readonly)
 	if (ctx->condstore) {
 		/* Enable while no mailbox is opened to avoid sending
 		   HIGHESTMODSEQ for previously opened mailbox */
-		(void)client_enable(client, MAILBOX_FEATURE_CONDSTORE);
+		client_enable(client, imap_feature_condstore);
 	}
 
 	ret = select_open(ctx, mailbox, readonly);

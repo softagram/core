@@ -15,7 +15,7 @@
 
 struct smtp_client_command {
 	pool_t pool;
-	unsigned int refcount;
+	int refcount;
 
 	struct smtp_client_command *prev, *next;
 
@@ -51,19 +51,40 @@ struct smtp_client_command {
 	bool aborting:1;
 };
 
+struct smtp_client_transaction_mail {
+	pool_t pool;
+	struct smtp_client_transaction *trans;
+
+	struct smtp_client_transaction_mail *prev, *next;
+
+	struct smtp_address *mail_from;
+	struct smtp_params_mail mail_params;
+
+	smtp_client_command_callback_t *mail_callback;
+	void *context;
+
+	struct smtp_client_command *cmd_mail_from;
+};
+
 struct smtp_client_transaction_rcpt {
 	pool_t pool;
 	struct smtp_client_transaction *trans;
+
+	struct smtp_client_transaction_rcpt *prev, *next;
 
 	struct smtp_address *rcpt_to;
 	struct smtp_params_rcpt rcpt_params;
 
 	smtp_client_command_callback_t *rcpt_callback;
-	smtp_client_command_callback_t *data_callback;
 	void *context;
+
+	smtp_client_command_callback_t *data_callback;
+	void *data_context;
 
 	struct smtp_client_command *cmd_rcpt_to;
 
+	bool external_pool:1;
+	bool queued:1;
 	bool failed:1;
 };
 
@@ -74,24 +95,29 @@ struct smtp_client_transaction {
 	struct smtp_client_transaction *prev, *next;
 
 	struct smtp_client_connection *conn;
-	struct smtp_address *mail_from;
-	struct smtp_params_mail mail_params;
+	enum smtp_client_transaction_flags flags;
 
 	enum smtp_client_transaction_state state;
-	struct smtp_client_command *cmd_mail_from, *cmd_data;
+	struct smtp_client_command *cmd_data, *cmd_rset;
 	struct smtp_client_command *cmd_plug, *cmd_last;
-	struct smtp_reply *failure;
+	struct smtp_reply *failure, *mail_failure;
 
-	smtp_client_command_callback_t *mail_from_callback;
-	void *mail_from_context;
+	struct smtp_client_transaction_mail *mail_head, *mail_tail;
+	struct smtp_client_transaction_mail *mail_send;
 
-	ARRAY(struct smtp_client_transaction_rcpt *) rcpts, rcpts_pending;
-	unsigned int rcpts_next_send_idx;
-	unsigned int rcpt_next_data_idx;
+	struct smtp_client_transaction_rcpt *rcpts_queue_head, *rcpts_queue_tail;
+	struct smtp_client_transaction_rcpt *rcpts_send;
+	struct smtp_client_transaction_rcpt *rcpts_head, *rcpts_tail;
+	struct smtp_client_transaction_rcpt *rcpts_data;
+	unsigned int rcpts_queue_count;
+	unsigned int rcpts_count;
 
 	struct istream *data_input;
 	smtp_client_command_callback_t *data_callback;
 	void *data_context;
+
+	smtp_client_command_callback_t *reset_callback;
+	void *reset_context;
 
 	smtp_client_transaction_callback_t *callback;
 	void *context;
@@ -101,8 +127,13 @@ struct smtp_client_transaction {
 	unsigned int finish_timeout_msecs;
 	struct timeout *to_finish, *to_send;
 
+	bool immediate:1;
+	bool sender_accepted:1;
 	bool data_provided:1;
+	bool reset:1;
 	bool finished:1;
+	bool submitting:1;
+	bool failing:1;
 	bool submitted_data:1;
 };
 
@@ -116,18 +147,22 @@ struct smtp_client_connection {
 	char *label;
 
 	enum smtp_protocol protocol;
-	const char *host;
+	const char *path, *host;
 	in_port_t port;
 	enum smtp_client_connection_ssl_mode ssl_mode;
 
 	struct smtp_client_settings set;
 	char *password;
+	ARRAY_TYPE(const_string) extra_capabilities;
 
-	enum smtp_capability capabilities;
 	pool_t cap_pool;
-	const char **cap_auth_mechanisms;
-	const char **cap_xclient_args;
-	uoff_t cap_size;
+	struct {
+		enum smtp_capability standard;
+		ARRAY(struct smtp_capability_extra) extra;
+		const char **auth_mechanisms;
+		const char **xclient_args;
+		uoff_t size;
+	} caps;
 
 	struct smtp_reply_parser *reply_parser;
 	struct smtp_reply reply;
@@ -163,13 +198,15 @@ struct smtp_client_connection {
 
 	bool old_smtp:1;
 	bool authenticated:1;
-	bool initial_xclient_sent:1;
+	bool xclient_sent:1;
 	bool connect_failed:1;
+	bool connect_succeeded:1;
 	bool handshake_failed:1;
 	bool corked:1;
 	bool sent_quit:1;
 	bool sending_command:1;
 	bool reset_needed:1;
+	bool failing:1;
 	bool destroying:1;
 	bool closed:1;
 };
@@ -193,6 +230,8 @@ void smtp_client_command_free(struct smtp_client_command *cmd);
 int smtp_client_command_send_more(struct smtp_client_connection *conn);
 int smtp_client_command_input_reply(struct smtp_client_command *cmd,
 				    const struct smtp_reply *reply);
+
+void smtp_client_command_drop_callback(struct smtp_client_command *cmd);
 
 void smtp_client_command_fail(struct smtp_client_command **_cmd,
 			      unsigned int status, const char *error);
@@ -223,6 +262,8 @@ struct connection_list *smtp_client_connection_list_init(void);
 
 const char *
 smpt_client_connection_label(struct smtp_client_connection *conn);
+
+void smtp_client_connection_send_xclient(struct smtp_client_connection *conn);
 
 void smtp_client_connection_fail(struct smtp_client_connection *conn,
 				 unsigned int status, const char *error);

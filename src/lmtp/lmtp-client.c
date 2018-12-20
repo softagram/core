@@ -1,7 +1,6 @@
 /* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
 
-#include "lib.h"
-#include "array.h"
+#include "lmtp-common.h"
 #include "base64.h"
 #include "str.h"
 #include "llist.h"
@@ -11,9 +10,7 @@
 #include "hostpid.h"
 #include "process-title.h"
 #include "var-expand.h"
-#include "settings-parser.h"
-#include "smtp-server.h"
-#include "master-service.h"
+#include "module-dir.h"
 #include "master-service-ssl.h"
 #include "master-service-settings.h"
 #include "iostream-ssl.h"
@@ -21,24 +18,24 @@
 #include "mail-storage.h"
 #include "mail-storage-service.h"
 #include "raw-storage.h"
-#include "main.h"
 #include "lda-settings.h"
-#include "lmtp-settings.h"
 #include "lmtp-local.h"
 #include "lmtp-proxy.h"
-#include "commands.h"
-#include "client.h"
+#include "lmtp-commands.h"
 
 #include <unistd.h>
 
 #define CLIENT_IDLE_TIMEOUT_MSECS (1000*60*5)
 
+static const struct smtp_server_callbacks lmtp_callbacks;
+static const struct lmtp_client_vfuncs lmtp_client_vfuncs;
+	
+struct lmtp_module_register lmtp_module_register = { 0 };
+
 static struct client *clients = NULL;
 static unsigned int clients_count = 0;
 
 static bool verbose_proctitle = FALSE;
-
-static const struct smtp_server_callbacks lmtp_callbacks;
 
 static const char *client_remote_id(struct client *client)
 {
@@ -76,6 +73,24 @@ static void refresh_proctitle(void)
 	}
 	str_append_c(title, ']');
 	process_title_set(str_c(title));
+}
+
+static void client_load_modules(struct client *client)
+{
+        struct module_dir_load_settings mod_set;
+
+        i_zero(&mod_set);
+        mod_set.abi_version = DOVECOT_ABI_VERSION;
+        mod_set.require_init_funcs = TRUE;
+        mod_set.binary_name = "lmtp";
+
+        /* pre-load all configured mail plugins */
+        mail_storage_service_modules =
+                module_dir_load_missing(mail_storage_service_modules,
+                                        client->lmtp_set->mail_plugin_dir,
+                                        client->lmtp_set->mail_plugins,
+                                        &mod_set);
+	module_dir_init(mail_storage_service_modules);
 }
 
 static void client_raw_user_create(struct client *client)
@@ -132,6 +147,7 @@ struct client *client_create(int fd_in, int fd_out,
 	pool = pool_alloconly_create("lmtp client", 2048);
 	client = p_new(pool, struct client, 1);
 	client->pool = pool;
+	client->v = lmtp_client_vfuncs;
 	client->remote_ip = conn->remote_ip;
 	client->remote_port = conn->remote_port;
 	client->local_ip = conn->local_ip;
@@ -140,10 +156,13 @@ struct client *client_create(int fd_in, int fd_out,
 
 	client_read_settings(client, conn->ssl);
 	client_raw_user_create(client);
+	client_load_modules(client);
 	client->my_domain = client->unexpanded_lda_set->hostname;
 
 	if (client->service_set->verbose_proctitle)
 		verbose_proctitle = TRUE;
+
+	p_array_init(&client->module_contexts, client->pool, 5);
 
 	i_zero(&lmtp_set);
 	lmtp_set.capabilities =
@@ -170,8 +189,13 @@ struct client *client_create(int fd_in, int fd_out,
 	DLLIST_PREPEND(&clients, client);
 	clients_count++;
 
-	smtp_server_connection_start(client->conn);
 	i_info("Connect from %s", client_remote_id(client));
+
+	if (hook_client_created != NULL)
+		hook_client_created(&client);
+
+	smtp_server_connection_start(client->conn);
+
 	refresh_proctitle();
 	return client;
 }
@@ -191,6 +215,13 @@ void client_state_reset(struct client *client)
 
 void client_destroy(struct client *client, const char *enh_code,
 		    const char *reason)
+{
+	client->v.destroy(client, enh_code, reason);
+}
+
+static void
+client_default_destroy(struct client *client, const char *enh_code,
+		       const char *reason)
 {
 	if (client->destroyed)
 		return;
@@ -244,11 +275,34 @@ void client_disconnect(struct client *client, const char *enh_code,
 }
 
 static void
+client_connection_trans_start(void *context,
+			      struct smtp_server_transaction *trans)
+{
+	struct client *client = context;
+
+	client->v.trans_start(client, trans);
+}
+
+static void
+client_default_trans_start(struct client *client ATTR_UNUSED,
+			   struct smtp_server_transaction *trans ATTR_UNUSED)
+{
+	/* nothing */
+}
+
+static void
 client_connection_trans_free(void *context,
-			     struct smtp_server_transaction *trans ATTR_UNUSED)
+			     struct smtp_server_transaction *trans)
 {
 	struct client *client = (struct client *)context;
 
+	client->v.trans_free(client, trans);
+}
+
+static void
+client_default_trans_free(struct client *client,
+			  struct smtp_server_transaction *trans ATTR_UNUSED)
+{
 	client_state_reset(client);
 }
 
@@ -327,6 +381,7 @@ static const struct smtp_server_callbacks lmtp_callbacks = {
 	.conn_cmd_data_begin = cmd_data_begin,
 	.conn_cmd_data_continue = cmd_data_continue,
 
+	.conn_trans_start = client_connection_trans_start,
 	.conn_trans_free = client_connection_trans_free,
 
 	.conn_state_changed = client_connection_state_changed,
@@ -337,4 +392,17 @@ static const struct smtp_server_callbacks lmtp_callbacks = {
 	.conn_destroy = client_connection_destroy,
 
 	.conn_is_trusted = client_connection_is_trusted
+};
+
+static const struct lmtp_client_vfuncs lmtp_client_vfuncs = {
+	.destroy = client_default_destroy,
+
+	.trans_start = client_default_trans_start,
+	.trans_free = client_default_trans_free,
+
+	.cmd_mail = client_default_cmd_mail,
+	.cmd_rcpt = client_default_cmd_rcpt,
+	.cmd_data = client_default_cmd_data,
+
+	.local_deliver = lmtp_local_default_deliver,
 };

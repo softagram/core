@@ -127,8 +127,7 @@ fetch_parse_modifier(struct imap_fetch_context *ctx,
 		return TRUE;
 	}
 	if (strcmp(name, "VANISHED") == 0 && cmd->uid) {
-		if ((ctx->client->enabled_features &
-		     MAILBOX_FEATURE_QRESYNC) == 0) {
+		if (!client_has_enabled(ctx->client, imap_feature_qresync)) {
 			client_send_command_error(cmd, "QRESYNC not enabled");
 			return FALSE;
 		}

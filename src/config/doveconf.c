@@ -47,6 +47,17 @@ struct config_dump_human_context {
 
 static const char *indent_str = "                              !!!!";
 
+static const char *const secrets[] = {
+	"key",
+	"secret",
+	"pass",
+	"http://",
+	"https://",
+	"ftp://",
+	NULL
+};
+
+
 static void
 config_request_get_strings(const char *key, const char *value,
 			   enum config_key_type type, void *context)
@@ -168,22 +179,86 @@ static bool value_need_quote(const char *value)
 	return FALSE;
 }
 
+static const char *find_next_secret(const char *input, const char **secret_r)
+{
+	const char *const *secret;
+	const char *ptr = NULL;
+	*secret_r = NULL;
+	for(secret = secrets; *secret != NULL; secret++) {
+		const char *cptr;
+		if ((cptr = strstr(input, *secret)) != NULL) {
+			if (ptr == NULL || cptr < ptr) {
+				*secret_r = *secret;
+				ptr = cptr;
+			}
+		}
+	}
+	i_assert(*secret_r != NULL || ptr == NULL);
+	return ptr;
+}
+
+static bool
+hide_url_userpart_from_value(struct ostream *output, const char **_ptr,
+			     const char **optr, bool quote)
+{
+	const char *ptr = *_ptr;
+	const char *start_of_user = ptr;
+	const char *start_of_host = NULL;
+	string_t *quoted = NULL;
+
+	if (quote)
+		quoted = t_str_new(256);
+
+	/* it's a URL, see if there is a userpart */
+	while(*ptr != '\0' && !i_isspace(*ptr) && *ptr != '/') {
+		if (*ptr == '@') {
+			start_of_host = ptr;
+			break;
+		}
+		ptr++;
+	}
+
+	if (quote) {
+		str_truncate(quoted, 0);
+		str_append_escaped(quoted, *optr, start_of_user - (*optr));
+		o_stream_nsend(output, quoted->data, quoted->used);
+	} else {
+		o_stream_nsend(output, *optr, start_of_user - (*optr));
+	}
+
+	if (start_of_host != NULL && start_of_host != start_of_user) {
+		o_stream_nsend_str(output, "#hidden_use-P_to_show#");
+	} else if (quote) {
+		str_truncate(quoted, 0);
+		str_append_escaped(quoted, start_of_user, ptr - start_of_user);
+		o_stream_nsend(output, quoted->data, quoted->used);
+	} else {
+		o_stream_nsend(output, start_of_user, ptr - start_of_user);
+	}
+
+	*optr = ptr;
+	*_ptr = ptr;
+	return TRUE;
+}
+
+static inline bool key_ends_with(const char *key, const char *eptr,
+				 const char *suffix)
+{
+	/* take = into account */
+	size_t n = strlen(suffix)+1;
+	return (eptr-key > (ptrdiff_t)n && str_begins(eptr-n, suffix));
+}
+
 static bool
 hide_secrets_from_value(struct ostream *output, const char *key,
 			const char *value)
 {
 	bool ret = FALSE, quote = value_need_quote(value);
-	const char *ptr, *optr;
-	const char *const secrets[] = {
-		"key",
-		"secret",
-		"pass",
-		NULL
-	};
+	const char *ptr, *optr, *secret;
 	if (*value != '\0' &&
-	    ((value-key > 8 && str_begins(value-9, "_password")) ||
-	     (value-key > 7 && str_begins(value-8, "_api_key")) ||
-	     str_begins(key, "ssl_key") ||
+	    (key_ends_with(key, value, "_password") ||
+	     key_ends_with(key, value, "_key") ||
+	     key_ends_with(key, value, "_nonce") ||
 	     str_begins(key, "ssl_dh"))) {
 		o_stream_nsend_str(output, "# hidden, use -P to show it");
 		return TRUE;
@@ -193,7 +268,12 @@ hide_secrets_from_value(struct ostream *output, const char *key,
 	   secrets. It should match things like secret_api_key or pass or password,
 	   etc. but not something like nonsecret. */
 	optr = ptr = value;
-	while((ptr = i_strstr_arr(ptr, secrets)) != NULL) {
+	while((ptr = find_next_secret(ptr, &secret)) != NULL) {
+		if (strstr(secret, "://") != NULL) {
+			ptr += strlen(secret);
+			if ((ret = hide_url_userpart_from_value(output, &ptr, &optr, quote)))
+				continue;
+		}
 		/* we have found something that we hide, and will deal with output
 		   here. */
 		ret = TRUE;
@@ -782,6 +862,7 @@ static void failure_exit_callback(int *status)
 int main(int argc, char *argv[])
 {
 	enum master_service_flags master_service_flags =
+		MASTER_SERVICE_FLAG_DONT_SEND_STATS |
 		MASTER_SERVICE_FLAG_STANDALONE |
 		MASTER_SERVICE_FLAG_NO_INIT_DATASTACK_FRAME;
 	enum config_dump_scope scope = CONFIG_DUMP_SCOPE_ALL;

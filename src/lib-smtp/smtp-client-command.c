@@ -211,6 +211,8 @@ void smtp_client_command_abort(struct smtp_client_command **_cmd)
 
 	*_cmd = NULL;
 
+	smtp_client_command_drop_callback(cmd);
+
 	if ((!disconnected && !cmd->plug && cmd->aborting) ||
 		state >= SMTP_CLIENT_COMMAND_STATE_FINISHED)
 		return;
@@ -223,7 +225,6 @@ void smtp_client_command_abort(struct smtp_client_command **_cmd)
 		i_assert(state < SMTP_CLIENT_COMMAND_STATE_FINISHED);
 		cmd->aborting = TRUE;
 	}
-	cmd->callback = NULL;
 	cmd->locked = FALSE;
 
 	i_assert(!cmd->plug || state <= SMTP_CLIENT_COMMAND_STATE_SUBMITTED);
@@ -273,6 +274,12 @@ void smtp_client_command_abort(struct smtp_client_command **_cmd)
 
 	if (!disconnected && waslocked && !conn->corked)
 		smtp_client_connection_trigger_output(conn);
+}
+
+void smtp_client_command_drop_callback(struct smtp_client_command *cmd)
+{
+	cmd->callback = NULL;
+	cmd->context = NULL;
 }
 
 void smtp_client_command_fail_reply(struct smtp_client_command **_cmd,
@@ -515,7 +522,7 @@ smtp_client_command_send_stream(struct smtp_client_command *cmd)
 	i_unreached();
 }
 
-int smtp_client_command_send_more(struct smtp_client_connection *conn)
+static int smtp_client_command_do_send_more(struct smtp_client_connection *conn)
 {
 	struct smtp_client_command *cmd;
 	const char *data;
@@ -546,13 +553,13 @@ int smtp_client_command_send_more(struct smtp_client_connection *conn)
 
 		cmd = conn->cmd_wait_list_head;
 		if (cmd != NULL &&
-		    (conn->capabilities & SMTP_CAPABILITY_PIPELINING) == 0) {
+		    (conn->caps.standard & SMTP_CAPABILITY_PIPELINING) == 0) {
 			/* cannot pipeline; wait for reply */
 			smtp_client_command_debug(cmd, "Pipeline occupied");
 			return 0;
 		}
 		while (cmd != NULL) {
-			if ((conn->capabilities & SMTP_CAPABILITY_PIPELINING) == 0 ||
+			if ((conn->caps.standard & SMTP_CAPABILITY_PIPELINING) == 0 ||
 				(cmd->flags & SMTP_CLIENT_COMMAND_FLAG_PIPELINE) == 0 ||
 				cmd->locked) {
 				/* cannot pipeline with previous command;
@@ -612,6 +619,17 @@ int smtp_client_command_send_more(struct smtp_client_connection *conn)
 		smtp_client_command_sent(cmd);
 	}
 	return 0;
+}
+
+int smtp_client_command_send_more(struct smtp_client_connection *conn)
+{
+	int ret;
+
+	if ((ret=smtp_client_command_do_send_more(conn)) < 0)
+		return -1;
+
+	smtp_client_connection_update_cmd_timeout(conn);
+	return ret;
 }
 
 static void
@@ -820,6 +838,7 @@ smtp_client_command_input_reply(struct smtp_client_command *cmd,
 		cmd->callback(reply, cmd->context);
 
 	if (finished) {
+		smtp_client_command_drop_callback(cmd);
 		smtp_client_command_unref(&cmd);
 		smtp_client_connection_trigger_output(conn);
 	}
@@ -951,36 +970,6 @@ smtp_client_command_rset_submit(
 
 /* MAIL FROM: */
 
-#undef smtp_client_command_mail_submit_after
-struct smtp_client_command *
-smtp_client_command_mail_submit_after(
-	struct smtp_client_connection *conn,
-	enum smtp_client_command_flags flags,
-	struct smtp_client_command *after,
-	const struct smtp_address *from,
-	const struct smtp_params_mail *params,
-	smtp_client_command_callback_t *callback, void *context)
-{
-	struct smtp_client_command *cmd;
-
-	cmd = smtp_client_command_new(conn,
-		flags | SMTP_CLIENT_COMMAND_FLAG_PIPELINE,
-		callback, context);
-	smtp_client_command_printf(cmd, "MAIL FROM:<%s>",
-		smtp_address_encode(from));
-	if (params != NULL) {
-		size_t orig_len = str_len(cmd->data);
-		str_append_c(cmd->data, ' ');
-		smtp_params_mail_write
-			(cmd->data, conn->capabilities, params);
-		if (str_len(cmd->data) == orig_len + 1)
-			str_truncate(cmd->data, orig_len);
-
-	}
-	smtp_client_command_submit_after(cmd, after);
-	return cmd;
-}
-
 #undef smtp_client_command_mail_submit
 struct smtp_client_command *
 smtp_client_command_mail_submit(
@@ -990,8 +979,25 @@ smtp_client_command_mail_submit(
 	const struct smtp_params_mail *params,
 	smtp_client_command_callback_t *callback, void *context)
 {
-	return smtp_client_command_mail_submit_after
-		(conn, flags, NULL, from, params, callback, context);
+	struct smtp_client_command *cmd;
+
+	smtp_client_connection_send_xclient(conn);
+
+	cmd = smtp_client_command_new(conn,
+		flags | SMTP_CLIENT_COMMAND_FLAG_PIPELINE,
+		callback, context);
+	smtp_client_command_printf(cmd, "MAIL FROM:<%s>",
+		smtp_address_encode(from));
+	if (params != NULL) {
+		size_t orig_len = str_len(cmd->data);
+		str_append_c(cmd->data, ' ');
+		smtp_params_mail_write(cmd->data, conn->caps.standard, params);
+		if (str_len(cmd->data) == orig_len + 1)
+			str_truncate(cmd->data, orig_len);
+
+	}
+	smtp_client_command_submit(cmd);
+	return cmd;
 }
 
 /* RCPT TO: */
@@ -1016,8 +1022,7 @@ smtp_client_command_rcpt_submit_after(
 	if (params != NULL) {
 		size_t orig_len = str_len(cmd->data);
 		str_append_c(cmd->data, ' ');
-		smtp_params_rcpt_write
-			(cmd->data, conn->capabilities, params);
+		smtp_params_rcpt_write(cmd->data, conn->caps.standard, params);
 		if (str_len(cmd->data) == orig_len + 1)
 			str_truncate(cmd->data, orig_len);
 	}
@@ -1324,7 +1329,7 @@ smtp_client_command_data_submit_after(
 	/* capture abort event with our context */
 	smtp_client_command_set_abort_callback(cmd, _cmd_data_abort_cb, ctx);
 
-	if ((conn->capabilities & SMTP_CAPABILITY_CHUNKING) == 0) {
+	if ((conn->caps.standard & SMTP_CAPABILITY_CHUNKING) == 0) {
 		/* DATA */
 		p_array_init(&ctx->cmds, ctx->pool, 1);
 

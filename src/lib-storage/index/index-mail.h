@@ -118,6 +118,7 @@ struct index_mail_data {
 	bool save_body_snippet:1;
 	bool stream_has_only_header:1;
 	bool parsed_bodystructure:1;
+	bool parsed_bodystructure_header:1;
 	bool hdr_size_set:1;
 	bool body_size_set:1;
 	bool messageparts_saved_to_cache:1;
@@ -264,6 +265,9 @@ void index_mail_cache_add(struct index_mail *mail, enum index_cache_field field,
 			  const void *data, size_t data_size);
 void index_mail_cache_add_idx(struct index_mail *mail, unsigned int field_idx,
 			      const void *data, size_t data_size);
+
+void index_mail_cache_pop3_data(struct mail *_mail,
+				const char *uidl, uint32_t order);
 
 struct istream *index_mail_cache_parse_init(struct mail *mail,
 					    struct istream *input);

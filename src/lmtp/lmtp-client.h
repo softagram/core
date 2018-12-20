@@ -6,9 +6,18 @@
 
 #define CLIENT_MAIL_DATA_MAX_INMEMORY_SIZE (1024*128)
 
+struct mail_storage;
+struct mail_deliver_context;
+union lmtp_module_context;
+struct lmtp_recipient;
+struct client;
+
 struct client_state {
 	const char *name;
 	unsigned int session_id_seq;
+
+	struct istream *data_input;
+	uoff_t data_size;
 
 	struct timeval data_end_timeval;
 
@@ -18,9 +27,35 @@ struct client_state {
 	const char *added_headers_proxy;
 };
 
+struct lmtp_client_vfuncs {
+	void (*destroy)(struct client *client, const char *enh_code,
+			const char *reason);
+
+	void (*trans_start)(struct client *client,
+			    struct smtp_server_transaction *trans);
+	void (*trans_free)(struct client *client,
+			   struct smtp_server_transaction *trans);
+
+	int (*cmd_mail)(struct client *client, struct smtp_server_cmd_ctx *cmd,
+			struct smtp_server_cmd_mail *data);
+	int (*cmd_rcpt)(struct client *client, struct smtp_server_cmd_ctx *cmd,
+			struct lmtp_recipient *lrcpt);
+	int (*cmd_data)(struct client *client,
+			struct smtp_server_cmd_ctx *cmd,
+			struct smtp_server_transaction *trans,
+			struct istream *data_input, uoff_t data_size);
+
+	int (*local_deliver)(struct client *client,
+			     struct lmtp_recipient *lrcpt,
+			     struct mail_deliver_context *dctx,
+			     struct mail_storage **storage_r);
+};
+
 struct client {
 	struct client *prev, *next;
 	pool_t pool;
+
+	struct lmtp_client_vfuncs v;
 
 	const struct setting_parser_info *user_set_info;
 	const struct lda_settings *unexpanded_lda_set;
@@ -42,9 +77,22 @@ struct client {
 	struct lmtp_local *local;
 	struct lmtp_proxy *proxy;
 
+	/* Module-specific contexts. */
+	ARRAY(union lmtp_module_context *) module_contexts;
+
 	bool disconnected:1;
 	bool destroyed:1;
 };
+
+struct lmtp_module_register {
+	unsigned int id;
+};
+
+union lmtp_module_context {
+	struct lmtp_client_vfuncs super;
+	struct lmtp_module_register *reg;
+};
+extern struct lmtp_module_register lmtp_module_register;
 
 struct client *client_create(int fd_in, int fd_out,
 			     const struct master_service_connection *conn);

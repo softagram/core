@@ -67,6 +67,7 @@ static unsigned ioloop_nested_depth = 0;
 /*
  * Test files
  */
+static const char unsafe_characters[] = "\"<>#%{}|\\^~[]` ;/?:@=&";
 
 static ARRAY_TYPE(const_string) files;
 static pool_t files_pool;
@@ -92,7 +93,8 @@ static void test_files_read_dir(const char *path)
 		errno = 0;
 		if ((dp=readdir(dirp)) == NULL)
 			break;
-		if (*dp->d_name == '.')
+		if (*dp->d_name == '.' ||
+		    dp->d_name[strcspn(dp->d_name, unsafe_characters)] != '\0')
 			continue;
 
 		file = t_abspath_to(dp->d_name, path);
@@ -561,7 +563,7 @@ static void client_init(int fd)
 
 	net_set_nonblock(fd, TRUE);
 
-	pool = pool_alloconly_create("client", 256);
+	pool = pool_alloconly_create("client", 512);
 	client = p_new(pool, struct client, 1);
 	client->pool = pool;
 
@@ -1935,6 +1937,7 @@ static void test_atexit(void)
 int main(int argc, char *argv[])
 {
 	int c;
+	int ret;
 
 	lib_init();
 #ifdef HAVE_OPENSSL
@@ -1965,11 +1968,12 @@ int main(int argc, char *argv[])
 	bind_ip.family = AF_INET;
 	bind_ip.u.ip4.s_addr = htonl(INADDR_LOOPBACK);
 
-	test_run(test_functions);
+	ret = test_run(test_functions);
 
 	ssl_iostream_context_cache_free();
 #ifdef HAVE_OPENSSL
 	ssl_iostream_openssl_deinit();
 #endif
 	lib_deinit();
+	return ret;
 }

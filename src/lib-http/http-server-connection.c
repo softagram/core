@@ -4,6 +4,7 @@
 #include "llist.h"
 #include "array.h"
 #include "str.h"
+#include "hostpid.h"
 #include "ioloop.h"
 #include "istream.h"
 #include "istream-timeout.h"
@@ -14,6 +15,7 @@
 #include "master-service.h"
 #include "master-service-ssl.h"
 #include "http-date.h"
+#include "http-url.h"
 #include "http-request-parser.h"
 
 #include "http-server-private.h"
@@ -160,6 +162,8 @@ bool http_server_connection_shut_down(struct http_server_connection *conn)
 
 static void http_server_connection_ready(struct http_server_connection *conn)
 {
+	const struct http_server_settings *set = &conn->server->set;
+	struct http_url base_url;
 	struct stat st;
 
 	if (conn->server->set.rawlog_dir != NULL &&
@@ -168,9 +172,19 @@ static void http_server_connection_ready(struct http_server_connection *conn)
 				       &conn->conn.input, &conn->conn.output);
 	}
 
-	conn->http_parser = http_request_parser_init
-		(conn->conn.input, &conn->server->set.request_limits,
-			HTTP_REQUEST_PARSE_FLAG_STRICT);
+	i_zero(&base_url);
+	if (set->default_host != NULL)
+		base_url.host.name = set->default_host;
+	else if (conn->ip.family != 0)
+		base_url.host.ip = conn->ip;
+	else
+		base_url.host.name = my_hostname;
+	base_url.port = conn->port;
+	base_url.have_ssl = conn->ssl;
+
+	conn->http_parser = http_request_parser_init(
+		conn->conn.input, &base_url, &conn->server->set.request_limits,
+		HTTP_REQUEST_PARSE_FLAG_STRICT);
 	o_stream_set_flush_callback(conn->conn.output,
     http_server_connection_output, conn);
 }
@@ -1067,8 +1081,6 @@ http_server_connection_create(struct http_server *server,
 	const struct http_server_settings *set = &server->set;
 	struct http_server_connection *conn;
 	static unsigned int id = 0;
-	struct ip_addr addr;
-	in_port_t port;
 	const char *name;
 
 	i_assert(!server->shutting_down);
@@ -1100,10 +1112,10 @@ http_server_connection_create(struct http_server *server,
 	}
 
 	/* get a name for this connection */
-	if (fd_in != fd_out || net_getpeername(fd_in, &addr, &port) < 0) {
+	if (fd_in != fd_out || net_getpeername(fd_in, &conn->ip, &conn->port) < 0) {
 		name = t_strdup_printf("[%u]", id);
 	} else {
-		if (addr.family == 0) {
+		if (conn->ip.family == 0) {
 			struct net_unix_cred cred;
 
 			if (net_getunixcred(fd_in, &cred) < 0) {
@@ -1114,10 +1126,14 @@ http_server_connection_create(struct http_server *server,
 				name = t_strdup_printf
 					("unix:pid=%ld,uid=%ld [%u]", (long)cred.pid, (long)cred.uid, id);
 			}
-		} else if (addr.family == AF_INET6) {
-			name = t_strdup_printf("[%s]:%u [%u]", net_ip2addr(&addr), port, id);
+		} else if (conn->ip.family == AF_INET6) {
+			name = t_strdup_printf("[%s]:%u [%u]",
+					       net_ip2addr(&conn->ip),
+					       conn->port, id);
 		} else {
-			name = t_strdup_printf("%s:%u [%u]", net_ip2addr(&addr), port, id);
+			name = t_strdup_printf("%s:%u [%u]",
+					       net_ip2addr(&conn->ip),
+					       conn->port, id);
 		}
 	}
 

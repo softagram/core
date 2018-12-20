@@ -215,6 +215,11 @@ void io_set_pending(struct io *io)
 	}
 }
 
+void io_set_never_wait_alone(struct io *io, bool set)
+{
+	io->never_wait_alone = set;
+}
+
 static void timeout_update_next(struct timeout *timeout, struct timeval *tv_now)
 {
 	if (tv_now == NULL) {
@@ -470,7 +475,7 @@ static int timeout_get_wait_time(struct timeout *timeout, struct timeval *tv_r,
 	return ret;
 }
 
-int io_loop_get_wait_time(struct ioloop *ioloop, struct timeval *tv_r)
+static int io_loop_get_wait_time(struct ioloop *ioloop, struct timeval *tv_r)
 {
 	struct timeval tv_now;
 	struct priorityq_item *item;
@@ -509,6 +514,25 @@ int io_loop_get_wait_time(struct ioloop *ioloop, struct timeval *tv_r)
 	   ioloop and after that we update ioloop_timeval immediately again. */
 	ioloop_timeval = tv_now;
 	ioloop_time = tv_now.tv_sec;
+	return msecs;
+}
+
+static bool io_loop_have_waitable_io_files(struct ioloop *ioloop)
+{
+	struct io_file *io;
+
+	for (io = ioloop->io_files; io != NULL; io = io->next) {
+		if (io->io.callback != NULL && !io->io.never_wait_alone)
+			return TRUE;
+	}
+	return FALSE;
+}
+
+int io_loop_run_get_wait_time(struct ioloop *ioloop, struct timeval *tv_r)
+{
+	int msecs = io_loop_get_wait_time(ioloop, tv_r);
+	if (msecs < 0 && !io_loop_have_waitable_io_files(ioloop))
+		i_panic("BUG: No IOs or timeouts set. Not waiting for infinity.");
 	return msecs;
 }
 
@@ -1071,6 +1095,9 @@ struct io *io_loop_move_io_to(struct ioloop *ioloop, struct io **_io)
 	struct io *old_io = *_io;
 	struct io_file *old_io_file, *new_io_file;
 
+	if (old_io == NULL)
+		return NULL;
+
 	i_assert((old_io->condition & IO_NOTIFY) == 0);
 
 	if (old_io->ioloop == ioloop)
@@ -1106,7 +1133,7 @@ struct timeout *io_loop_move_timeout_to(struct ioloop *ioloop,
 {
 	struct timeout *new_to, *old_to = *_timeout;
 
-	if (old_to->ioloop == ioloop)
+	if (old_to == NULL || old_to->ioloop == ioloop)
 		return old_to;
 
 	new_to = timeout_copy(old_to, ioloop);

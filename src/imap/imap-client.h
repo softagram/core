@@ -166,7 +166,7 @@ struct client {
         struct mailbox_keywords keywords;
 	unsigned int sync_counter;
 	uint32_t messages_count, recent_count, uidvalidity;
-	enum mailbox_feature enabled_features;
+	ARRAY(bool) enabled_features;
 
 	time_t last_input, last_output;
 	unsigned int bad_counter;
@@ -252,6 +252,9 @@ extern struct imap_module_register imap_module_register;
 extern struct client *imap_clients;
 extern unsigned int imap_client_count;
 
+extern unsigned int imap_feature_condstore;
+extern unsigned int imap_feature_qresync;
+
 /* Create new client with specified input/output handles. socket specifies
    if the handle is a socket. */
 struct client *client_create(int fd_in, int fd_out, const char *session_id,
@@ -307,7 +310,14 @@ bool client_read_string_args(struct client_command_context *cmd,
    have to wait for an existing SEARCH SAVE to finish. */
 bool client_handle_search_save_ambiguity(struct client_command_context *cmd);
 
-int client_enable(struct client *client, enum mailbox_feature features);
+void client_enable(struct client *client, unsigned int feature_idx);
+/* Returns TRUE if the given feature is enabled */
+bool client_has_enabled(struct client *client, unsigned int feature_idx);
+/* Returns mailbox features that are currently enabled. */
+enum mailbox_feature client_enabled_mailbox_features(struct client *client);
+/* Returns all enabled features as strings. */
+const char *const *client_enabled_features(struct client *client);
+
 /* Send client processing to imap-idle process. If successful, returns TRUE
    and destroys the client. */
 bool imap_client_hibernate(struct client **client);
@@ -333,6 +343,7 @@ void client_input(struct client *client);
 bool client_handle_input(struct client *client);
 int client_output(struct client *client);
 
+void clients_init(void);
 void clients_destroy_all(void);
 
 #endif

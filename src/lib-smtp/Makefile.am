@@ -41,6 +41,7 @@ libsmtp_la_SOURCES = \
 	$(smtp_server_cmds) \
 	smtp-server-reply.c \
 	smtp-server-command.c \
+	smtp-server-recipient.c \
 	smtp-server-transaction.c \
 	smtp-server-connection.c \
 	smtp-server.c \
@@ -83,6 +84,10 @@ test_programs = \
 test_nocheck_programs =
 
 noinst_PROGRAMS = $(test_programs) $(test_nocheck_programs)
+
+EXTRA_DIST = \
+	test-bin/sendmail-exit-1.sh \
+	test-bin/sendmail-success.sh
 
 test_libs = \
 	$(noinst_LTLIBRARIES) \

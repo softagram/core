@@ -15,11 +15,13 @@
 	(SMTP_CAPABILITY_SIZE | SMTP_CAPABILITY_ENHANCEDSTATUSCODES | \
 		SMTP_CAPABILITY_8BITMIME | SMTP_CAPABILITY_CHUNKING)
 
+struct smtp_server_cmd_hook;
 struct smtp_server_reply;
 struct smtp_server_command;
 struct smtp_server_connection;
 
 ARRAY_DEFINE_TYPE(smtp_server_reply, struct smtp_server_reply);
+ARRAY_DEFINE_TYPE(smtp_server_cmd_hook, struct smtp_server_cmd_hook);
 
 enum smtp_server_command_state {
 	/* New command; callback to command start handler executing. */
@@ -44,6 +46,22 @@ enum smtp_server_command_state {
 	SMTP_SERVER_COMMAND_STATE_ABORTED
 };
 
+struct smtp_server_command_hook {
+	enum smtp_server_command_hook_type type;
+	struct smtp_server_command_hook *prev, *next;
+
+	smtp_server_cmd_func_t *func;
+	void *context;
+};
+
+struct smtp_server_recipient_hook {
+	enum smtp_server_recipient_hook_type type;
+	struct smtp_server_recipient_hook *prev, *next;
+
+	smtp_server_rcpt_func_t *func;
+	void *context;
+};
+
 struct smtp_server_reply_content {
 	unsigned int status;
 	const char *status_prefix;
@@ -61,6 +79,7 @@ struct smtp_server_reply {
 
 	bool submitted:1;
 	bool sent:1;
+	bool forwarded:1;
 };
 
 struct smtp_server_command_reg {
@@ -73,32 +92,32 @@ struct smtp_server_command {
 	struct smtp_server_cmd_ctx context;
 	const struct smtp_server_command_reg *reg;
 
-	unsigned int refcount;
+	int refcount;
 
 	enum smtp_server_command_state state;
 
 	struct smtp_server_command *prev, *next;
 
+	struct smtp_server_command_hook *hooks_head, *hooks_tail;
+	void *data;
+
 	ARRAY_TYPE(smtp_server_reply) replies;
 	unsigned int replies_expected;
 	unsigned int replies_submitted;
 
-	/* private hooks */
-
-	/* next: command is next to reply but has not submittted all replies yet */
-	smtp_server_cmd_func_t *hook_next;
-	/* replied: command has submitted all replies */
-	smtp_server_cmd_func_t *hook_replied;
-	/* completed: server is about to send last replies for this command */
-	smtp_server_cmd_func_t *hook_completed;
-	/* destroy: command is about to be destroyed */
-	smtp_server_cmd_func_t *hook_destroy;
-	/* private context data */
-	void *data;
-
 	bool input_locked:1;
 	bool input_captured:1;
 	bool reply_early:1;
+	bool destroying:1;
+};
+
+struct smtp_server_recipient_private {
+	struct smtp_server_recipient rcpt;
+	int refcount;
+
+	struct smtp_server_recipient_hook *hooks_head, *hooks_tail;
+
+	bool destroying:1;
 };
 
 struct smtp_server_state_data {
@@ -121,9 +140,14 @@ struct smtp_server_connection {
 	struct connection conn;
 	struct smtp_server *server;
 	pool_t pool;
-	unsigned int refcount;
+	int refcount;
 
 	struct smtp_server_settings set;
+
+	ARRAY(struct smtp_capability_extra) extra_capabilities;
+	ARRAY_TYPE(const_string) mail_param_extensions; /* NULL-terminated */
+	ARRAY_TYPE(const_string) rcpt_param_extensions; /* NULL-terminated */
+
 	const struct smtp_server_callbacks *callbacks;
 	void *context;
 
@@ -138,7 +162,7 @@ struct smtp_server_connection {
 	unsigned int proxy_timeout_secs;
 
 	struct smtp_server_helo_data helo, *pending_helo;
-	char *helo_domain, *helo_login, *username;
+	char *helo_domain, *username;
 	unsigned int id;
 
 	struct timeout *to_idle;
@@ -235,14 +259,20 @@ void smtp_server_command_ref(struct smtp_server_command *cmd);
 bool smtp_server_command_unref(struct smtp_server_command **_cmd);
 void smtp_server_command_abort(struct smtp_server_command **_cmd);
 
+bool smtp_server_command_call_hooks(struct smtp_server_command **_cmd,
+				    enum smtp_server_command_hook_type type);
+void smtp_server_command_remove_hooks(struct smtp_server_command *cmd,
+				      enum smtp_server_command_hook_type type);
+
 void smtp_server_command_submit_reply(struct smtp_server_command *cmd);
 
 int smtp_server_connection_flush(struct smtp_server_connection *conn);
 
 void smtp_server_command_ready_to_reply(struct smtp_server_command *cmd);
-void smtp_server_command_next_to_reply(struct smtp_server_command *cmd);
-void smtp_server_command_completed(struct smtp_server_command *cmd);
 void smtp_server_command_finished(struct smtp_server_command *cmd);
+
+bool smtp_server_command_next_to_reply(struct smtp_server_command **_cmd);
+bool smtp_server_command_completed(struct smtp_server_command **_cmd);
 
 static inline bool
 smtp_server_command_is_complete(struct smtp_server_command *cmd)
@@ -323,6 +353,10 @@ void smtp_server_connection_timeout_reset(struct smtp_server_connection *conn);
 
 void smtp_server_connection_send_line(struct smtp_server_connection *conn,
 	const char *fmt, ...) ATTR_FORMAT(2, 3);
+void smtp_server_connection_reply_lines(struct smtp_server_connection *conn,
+				        unsigned int status,
+					const char *enh_code,
+					const char *const *text_lines);
 void smtp_server_connection_reply_immediate(
 	struct smtp_server_connection *conn, unsigned int status,
 	const char *fmt, ...) ATTR_FORMAT(3, 4);
@@ -342,23 +376,41 @@ void smtp_server_connection_set_proxy_data(struct smtp_server_connection *conn,
 	const struct smtp_proxy_data *proxy_data);
 
 /*
+ * Recipient
+ */
+
+struct smtp_server_recipient *
+smtp_server_recipient_create(struct smtp_server_cmd_ctx *cmd,
+			     const struct smtp_address *rcpt_to);
+void smtp_server_recipient_ref(struct smtp_server_recipient *rcpt);
+bool smtp_server_recipient_unref(struct smtp_server_recipient **_rcpt);
+void smtp_server_recipient_destroy(struct smtp_server_recipient **_rcpt);
+
+bool smtp_server_recipient_approved(struct smtp_server_recipient **_rcpt);
+void smtp_server_recipient_last_data(struct smtp_server_recipient *rcpt,
+				     struct smtp_server_cmd_ctx *cmd);
+
+/*
  * Transaction
  */
 
 struct smtp_server_transaction *
 smtp_server_transaction_create(struct smtp_server_connection *conn,
-	const struct smtp_address *mail_from,
-	const struct smtp_params_mail *params,
-	const struct timeval *timestamp);
+			       enum smtp_server_transaction_flags flags,
+			       const struct smtp_address *mail_from,
+			       const struct smtp_params_mail *params,
+			       const struct timeval *timestamp);
 void smtp_server_transaction_free(struct smtp_server_transaction **_trans);
 
-struct smtp_server_recipient *
-smtp_server_transaction_add_rcpt(struct smtp_server_transaction *trans,
-	const struct smtp_address *rcpt_to,
-	const struct smtp_params_rcpt *params);
+void smtp_server_transaction_add_rcpt(struct smtp_server_transaction *trans,
+				      struct smtp_server_recipient *rcpt);
 bool smtp_server_transaction_has_rcpt(struct smtp_server_transaction *trans);
 unsigned int
 smtp_server_transaction_rcpt_count(struct smtp_server_transaction *trans);
+
+
+void smtp_server_transaction_last_data(struct smtp_server_transaction *trans,
+				       struct smtp_server_cmd_ctx *cmd);
 
 /*
  * Server

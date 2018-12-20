@@ -58,13 +58,11 @@ void event_logv(struct event *event, const struct event_log_params *params,
    afterwards. It doesn't apply to existing child events (mainly for
    performance reasons).
 
-   Note that it's always recommended to use e.g.:
-     if (set->debug) event_set_forced_debug(event, TRUE); // good
-   instead of
-     event_set_forced_debug(event, set->debug); // bad
-   This is because the event may already have had debugging enabled via the
-   parent event. Forcing it to FALSE is most likely not wanted. */
+   Note that event_set_forced_debug(event, FALSE) is a no-op. To disable
+   forced-debug, use event_unset_forced_debug(event). */
 struct event *event_set_forced_debug(struct event *event, bool force);
+/* Set the forced-debug to FALSE */
+struct event *event_unset_forced_debug(struct event *event);
 /* Set the global filter to logging debug events. */
 void event_set_global_debug_log_filter(struct event_filter *filter);
 /* Return the current global debug log event filter. */

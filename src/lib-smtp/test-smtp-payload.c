@@ -327,11 +327,11 @@ test_server_conn_trans_free(void *context ATTR_UNUSED,
 static int
 test_server_conn_cmd_rcpt(void *conn_ctx ATTR_UNUSED,
 	struct smtp_server_cmd_ctx *cmd ATTR_UNUSED,
-	struct smtp_server_cmd_rcpt *data)
+	struct smtp_server_recipient *rcpt)
 {
 	if (debug) {
 		i_debug("test server: RCPT TO:%s",
-			smtp_address_encode(data->path));
+			smtp_address_encode(rcpt->path));
 	}
 
 	return 1;
@@ -727,7 +727,8 @@ static void test_client_continue(void *dummy ATTR_UNUSED)
 
 		tctrans->trans = smtp_client_transaction_create(tctrans->conn,
 			SMTP_ADDRESS_LITERAL("user", "example.com"),
-			&mail_params, test_client_transaction_finish, tctrans);
+			&mail_params, 0,
+			test_client_transaction_finish, tctrans);
 		smtp_client_connection_unref(&tctrans->conn);
 
 		rcpts = tctrans->files_idx % 10 + 1;
@@ -1052,6 +1053,7 @@ static void test_atexit(void)
 int main(int argc, char *argv[])
 {
 	int c;
+	int ret;
 
 	lib_init();
 #ifdef HAVE_OPENSSL
@@ -1082,11 +1084,13 @@ int main(int argc, char *argv[])
 	bind_ip.family = AF_INET;
 	bind_ip.u.ip4.s_addr = htonl(INADDR_LOOPBACK);
 
-	test_run(test_functions);
+	ret = test_run(test_functions);
 
 	ssl_iostream_context_cache_free();
 #ifdef HAVE_OPENSSL
 	ssl_iostream_openssl_deinit();
 #endif
 	lib_deinit();
+
+	return ret;
 }

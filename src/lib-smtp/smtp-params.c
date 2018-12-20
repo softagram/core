@@ -100,10 +100,12 @@ static bool smtp_param_value_valid(const char *value)
 
 void smtp_param_write(string_t *out, const struct smtp_param *param)
 {
-	i_assert(smtp_param_value_valid(param->value));
 	str_append(out, t_str_ucase(param->keyword));
-	str_append_c(out, '=');
-	str_append(out, param->value);
+	if (param->value != NULL) {
+		i_assert(smtp_param_value_valid(param->value));
+		str_append_c(out, '=');
+		str_append(out, param->value);
+	}
 }
 
 /*
@@ -169,7 +171,7 @@ static int smtp_params_mail_parse_auth(
 
 static int smtp_params_mail_parse_body(
 	struct smtp_params_mail_parser *pmparser,
-	const char *value, bool extensions)
+	const char *value, const char *const *extensions)
 {
 	struct smtp_params_mail *params = pmparser->params;
 	enum smtp_capability caps = pmparser->caps;
@@ -204,7 +206,8 @@ static int smtp_params_mail_parse_body(
 			strcmp(value, "BINARYMIME") == 0) {
 		params->body.type = SMTP_PARAM_MAIL_BODY_TYPE_BINARYMIME;
 	/* =?? */
-	} else if (extensions) {
+	} else if (extensions != NULL &&
+		   str_array_icase_find(extensions, value)) {
 		params->body.type = SMTP_PARAM_MAIL_BODY_TYPE_EXTENSION;
 		params->body.ext = p_strdup(pmparser->pool, value);
 	} else {
@@ -331,10 +334,12 @@ smtp_params_mail_parse_size(
 }
 
 int smtp_params_mail_parse(pool_t pool, const char *args,
-	enum smtp_capability caps, bool extensions,
-	struct smtp_params_mail *params_r,
-	enum smtp_param_parse_error *error_code_r,
-	const char **error_r)
+			   enum smtp_capability caps,
+			   const char *const *extensions,
+			   const char *const *body_extensions,
+			   struct smtp_params_mail *params_r,
+			   enum smtp_param_parse_error *error_code_r,
+			   const char **error_r)
 {
 	struct smtp_params_mail_parser pmparser;
 	struct smtp_param param;
@@ -369,8 +374,8 @@ int smtp_params_mail_parse(pool_t pool, const char *args,
 				break;
 			}
 		} else if (strcmp(param.keyword, "BODY") == 0) {
-			if (smtp_params_mail_parse_body
-				(&pmparser, param.value, extensions) < 0) {
+			if (smtp_params_mail_parse_body(
+				&pmparser, param.value, body_extensions) < 0) {
 				ret = -1;
 				break;
 			}
@@ -395,14 +400,12 @@ int smtp_params_mail_parse(pool_t pool, const char *args,
 				ret = -1;
 				break;
 			}
-		} else if (extensions) {
+		} else if (extensions != NULL &&
+			   str_array_icase_find(extensions, param.keyword)) {
 			/* add the rest to ext_param for specific
 			   applications */
-			if (!array_is_created(&params_r->extra_params))
-				p_array_init(&params_r->extra_params, pool, 4);
-			param.keyword = p_strdup(pool, param.keyword);
-			param.value = p_strdup(pool, param.value);
-			array_append(&params_r->extra_params, &param, 1);
+			smtp_params_mail_add_extra(params_r, pool,
+						   param.keyword, param.value);
 		} else {
 			/* RFC 5321, Section 4.1.1.11:
 			   If the server SMTP does not recognize or cannot
@@ -451,6 +454,41 @@ void smtp_params_mail_copy(pool_t pool,
 			array_append(&dst->extra_params, &param_new, 1);
 		}
 	}
+}
+
+void smtp_params_mail_add_extra(struct smtp_params_mail *params, pool_t pool,
+				const char *keyword, const char *value)
+{
+	struct smtp_param param;
+
+	if (!array_is_created(&params->extra_params))
+		p_array_init(&params->extra_params, pool, 4);
+
+	i_zero(&param);
+	param.keyword = p_strdup(pool, keyword);
+	param.value = p_strdup(pool, value);
+	array_append(&params->extra_params, &param, 1);
+}
+
+bool smtp_params_mail_drop_extra(struct smtp_params_mail *params,
+				 const char *keyword, const char **value_r)
+{
+	const struct smtp_param *param;
+
+	if (!array_is_created(&params->extra_params))
+		return FALSE;
+
+	array_foreach(&params->extra_params, param) {
+		if (strcasecmp(param->keyword, keyword) == 0) {
+			if (value_r != NULL)
+				*value_r = param->value;
+			array_delete(&params->extra_params,
+				     array_foreach_idx(&params->extra_params,
+						       param), 1);
+			return TRUE;
+		}
+	}
+	return FALSE;
 }
 
 /* write */
@@ -708,7 +746,7 @@ smtp_params_rcpt_parse_orcpt_rfc822(const char *addr_str,
 	struct smtp_address *addr;
 
 	rfc822_addr = message_address_parse(pool_datastack_create(),
-		(const unsigned char *)addr_str, strlen(addr_str), 2, FALSE);
+		(const unsigned char *)addr_str, strlen(addr_str), 2, 0);
 	if (rfc822_addr == NULL || rfc822_addr->invalid_syntax ||
 	    rfc822_addr->next != NULL ||
 	    smtp_address_create_from_msg(pool, rfc822_addr, &addr) < 0)
@@ -821,10 +859,11 @@ smtp_params_rcpt_parse_orcpt(struct smtp_params_rcpt_parser *prparser,
 }
 
 int smtp_params_rcpt_parse(pool_t pool, const char *args,
-	enum smtp_capability caps, bool extensions,
-	struct smtp_params_rcpt *params_r,
-	enum smtp_param_parse_error *error_code_r,
-	const char **error_r)
+			   enum smtp_capability caps,
+			   const char *const *extensions,
+			   struct smtp_params_rcpt *params_r,
+			   enum smtp_param_parse_error *error_code_r,
+			   const char **error_r)
 {
 	struct smtp_params_rcpt_parser prparser;
 	struct smtp_param param;
@@ -866,14 +905,12 @@ int smtp_params_rcpt_parse(pool_t pool, const char *args,
 				ret = -1;
 				break;
 			}
-		} else if (extensions) {
+		} else if (extensions != NULL &&
+			   str_array_icase_find(extensions, param.keyword)) {
 			/* add the rest to ext_param for specific applications
 			 */
-			if (!array_is_created(&params_r->extra_params))
-				p_array_init(&params_r->extra_params, pool, 4);
-			param.keyword = p_strdup(pool, param.keyword);
-			param.value = p_strdup(pool, param.value);
-			array_append(&params_r->extra_params, &param, 1);
+			smtp_params_rcpt_add_extra(params_r, pool,
+						   param.keyword, param.value);
 		} else {
 			/* RFC 5321, Section 4.1.1.11:
 			   If the server SMTP does not recognize or cannot
@@ -920,6 +957,41 @@ void smtp_params_rcpt_copy(pool_t pool,
 			array_append(&dst->extra_params, &param_new, 1);
 		}
 	}
+}
+
+void smtp_params_rcpt_add_extra(struct smtp_params_rcpt *params, pool_t pool,
+				const char *keyword, const char *value)
+{
+	struct smtp_param param;
+
+	if (!array_is_created(&params->extra_params))
+		p_array_init(&params->extra_params, pool, 4);
+
+	i_zero(&param);
+	param.keyword = p_strdup(pool, keyword);
+	param.value = p_strdup(pool, value);
+	array_append(&params->extra_params, &param, 1);
+}
+
+bool smtp_params_rcpt_drop_extra(struct smtp_params_rcpt *params,
+				 const char *keyword, const char **value_r)
+{
+	const struct smtp_param *param;
+
+	if (!array_is_created(&params->extra_params))
+		return FALSE;
+
+	array_foreach(&params->extra_params, param) {
+		if (strcasecmp(param->keyword, keyword) == 0) {
+			if (value_r != NULL)
+				*value_r = param->value;
+			array_delete(&params->extra_params,
+				     array_foreach_idx(&params->extra_params,
+						       param), 1);
+			return TRUE;
+		}
+	}
+	return FALSE;
 }
 
 /* write */
